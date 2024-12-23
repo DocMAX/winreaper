@@ -1,161 +1,232 @@
 #include <windows.h>
-#include <iostream>
 #include <tlhelp32.h>
-#include <string>
-#include <vector>
-#include <memory>
-#include <set>
-#include <chrono>
+#include <iostream>
 #include <thread>
+#include <chrono>
+#include <unordered_map>
+#include <string>
 
-std::wstring getProcessName(DWORD pid) {
-    PROCESSENTRY32 entry;
-    entry.dwSize = sizeof(PROCESSENTRY32);
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+struct ProcessInfo {
+    DWORD pid;
+    std::wstring name;
+    DWORD parentPid;
+    std::wstring commandLine;
+    bool isValid;
+};
 
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"Failed to take process snapshot: " << GetLastError() << L"\n";
-        return L"Unknown";
-    }
-
-    if (Process32First(hSnapshot, &entry)) {
-        do {
-            if (entry.th32ProcessID == pid) {
-                CloseHandle(hSnapshot);
-                return entry.szExeFile;
-            }
-        } while (Process32Next(hSnapshot, &entry));
-    }
-
-    CloseHandle(hSnapshot);
-    return L"Unknown";
-}
-
-void waitForProcess(DWORD pid) {
-    HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
-    if (hProcess == NULL) {
-        std::wcerr << L"Failed to open process with PID " << pid << L": " << GetLastError() << L"\n";
-        return;
-    }
-
-    // Wait for the process to finish
-    WaitForSingleObject(hProcess, INFINITE);
+bool isProcessRunning(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess == NULL) return false;
+    
+    DWORD exitCode;
+    bool isRunning = GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE;
     CloseHandle(hProcess);
+    return isRunning;
 }
 
-std::vector<DWORD> getChildProcesses(DWORD parentPid) {
-    std::vector<DWORD> childPids;
-    PROCESSENTRY32 entry;
-    entry.dwSize = sizeof(PROCESSENTRY32);
-
+// Move getProcessInfo before ProcessTree
+ProcessInfo getProcessInfo(DWORD pid) {
+    ProcessInfo info = { pid, L"", 0, L"", false };
+    
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"Failed to take process snapshot: " << GetLastError() << L"\n";
-        return childPids;
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W entry;
+        entry.dwSize = sizeof(PROCESSENTRY32W);
+
+        if (Process32FirstW(hSnapshot, &entry)) {
+            do {
+                if (entry.th32ProcessID == pid) {
+                    info.name = entry.szExeFile;
+                    info.parentPid = entry.th32ParentProcessID;
+                    info.isValid = true;
+                    break;
+                }
+            } while (Process32NextW(hSnapshot, &entry));
+        }
+        CloseHandle(hSnapshot);
+    }
+    
+    if (info.name.empty() && info.isValid) {
+        info.name = L"<unknown>";
     }
 
-    if (Process32First(hSnapshot, &entry)) {
-        do {
-            if (entry.th32ParentProcessID == parentPid) {
-                childPids.push_back(entry.th32ProcessID);
+    return info;
+}
+
+class ProcessTree {
+private:
+    std::unordered_map<DWORD, ProcessInfo> processes;
+    DWORD rootPid;
+    DWORD gameProcessPid;
+    std::wstring initialCommand;
+
+public:
+    ProcessTree(DWORD initialPid, const std::wstring& cmd) 
+        : rootPid(initialPid), gameProcessPid(0), initialCommand(cmd) {
+        // Add the current process (winreaper) to the tracked processes
+        ProcessInfo self = getProcessInfo(GetCurrentProcessId());
+        self.commandLine = initialCommand;
+        processes[GetCurrentProcessId()] = self;
+    }
+
+    bool shouldTrack(DWORD pid, DWORD parentPid) const {
+        // Track if it's the root process
+        if (pid == rootPid) return true;
+        
+        // Track if it's a child of any process we're already tracking
+        if (processes.find(parentPid) != processes.end()) return true;
+        
+        // Track if it's the game process or its children
+        if (gameProcessPid != 0 && (pid == gameProcessPid || isDescendant(parentPid))) return true;
+
+        return false;
+    }
+
+    bool isDescendant(DWORD pid) const {
+        if (pid == 0) return false;
+        
+        DWORD currentPid = pid;
+        int depth = 0;  // Prevent infinite loops
+        while (currentPid != 0 && depth < 10) {
+            if (currentPid == rootPid || currentPid == gameProcessPid) return true;
+            auto it = processes.find(currentPid);
+            if (it == processes.end()) break;
+            currentPid = it->second.parentPid;
+            depth++;
+        }
+        return false;
+    }
+
+    void addProcess(const ProcessInfo& info) {
+        processes[info.pid] = info;
+        
+        // If this is the game process, track it
+        if (info.name.find(L"APlagueTaleInnocence_x64.exe") != std::wstring::npos) {
+            gameProcessPid = info.pid;
+        }
+    }
+
+    bool isTracked(DWORD pid) const {
+        return processes.find(pid) != processes.end();
+    }
+
+    bool isWatchedForExit(DWORD pid) const {
+        return pid == gameProcessPid || isDescendant(pid);
+    }
+
+    std::wstring getProcessName(DWORD pid) const {
+        if (pid == GetCurrentProcessId()) {
+            return L"winreaper.exe";  // Always return our own name
+        }
+        auto it = processes.find(pid);
+        return it != processes.end() ? it->second.name : L"<unknown>";
+    }
+
+    bool isRunning() const {
+        for (const auto& pair : processes) {
+            if (isProcessRunning(pair.first)) {
+                if (pair.first == gameProcessPid || isDescendant(pair.first)) {
+                    return true;
+                }
             }
-        } while (Process32Next(hSnapshot, &entry));
-    }
-    CloseHandle(hSnapshot);
-
-    return childPids;
-}
-
-void logProcessStatus(const std::set<DWORD>& previousPids, const std::set<DWORD>& currentPids) {
-    for (DWORD pid : previousPids) {
-        if (currentPids.find(pid) == currentPids.end()) {
-            std::wcout << L"Process with PID " << pid << L" (" << getProcessName(pid) << L") has exited.\n";
         }
+        return false;
     }
-
-    for (DWORD pid : currentPids) {
-        if (previousPids.find(pid) == previousPids.end()) {
-            std::wcout << L"New process with PID " << pid << L" (" << getProcessName(pid) << L") has started.\n";
-        }
-    }
-}
-
-void monitorSubProcesses(DWORD parentPid, bool& exitFlag) {
-    std::set<DWORD> currentChildPids = { parentPid };
-    while (!exitFlag) {
-        std::vector<DWORD> childPids = getChildProcesses(parentPid);
-
-        std::set<DWORD> newChildPids(childPids.begin(), childPids.end());
-
-        logProcessStatus(currentChildPids, newChildPids);
-
-        currentChildPids = newChildPids;
-
-        // Wait for 1 second to update the list of subprocesses regularly
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-}
-
-void waitForAllProcesses(DWORD parentPid) {
-    // Wait for the main process to finish
-    waitForProcess(parentPid);
-
-    // Then wait for all child processes
-    std::vector<DWORD> childPids = getChildProcesses(parentPid);
-    for (DWORD childPid : childPids) {
-        waitForProcess(childPid);
-    }
-}
+};
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        std::wcerr << L"Usage: " << argv[0] << L" <program>\n";
+        std::wcerr << L"Usage: " << argv[0] << L" <program> [args...]\n";
         return 1;
     }
 
-    wchar_t* program = argv[1];
-    STARTUPINFO si = { sizeof(STARTUPINFO) };
+    std::wstring commandLine = argv[1];
+    for (int i = 2; i < argc; ++i) {
+        commandLine += L" ";
+        commandLine += argv[i];
+    }
+
+    STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
 
-    // Start the process
-    if (!CreateProcess(
-        NULL,       // Application path
-        program,    // Command to run the program
-        NULL,       // Process security attributes
-        NULL,       // Thread security attributes
-        FALSE,      // No inheritance of handles
-        CREATE_NEW_CONSOLE, // New console window
-        NULL,       // Environment (unchanged)
-        NULL,       // Current directory (unchanged)
-        &si,        // STARTUPINFO structure
-        &pi         // PROCESS_INFORMATION structure
-    )) {
-        std::wcerr << L"Failed to start process: " << GetLastError() << L"\n";
+    if (!CreateProcessW(NULL, commandLine.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        std::wcerr << L"Failed to create process: " << GetLastError() << L"\n";
         return 1;
     }
 
-    std::wcout << L"Main process started: " << program << L"\n";
+    ProcessTree processTree(pi.dwProcessId, commandLine);
+    std::unordered_map<DWORD, ProcessInfo> currentProcesses;
+    std::unordered_map<DWORD, ProcessInfo> previousProcesses;
 
-    // Flag to exit the monitoring thread
-    bool exitFlag = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // Start the process monitoring thread
-    std::thread monitorThread(monitorSubProcesses, pi.dwProcessId, std::ref(exitFlag));
+    while (true) {
+        currentProcesses.clear();
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W entry;
+            entry.dwSize = sizeof(PROCESSENTRY32W);
 
-    // Wait for the main process and all its child processes
-    waitForAllProcesses(pi.dwProcessId);
+            if (Process32FirstW(hSnapshot, &entry)) {
+                do {
+                    ProcessInfo info = { 
+                        entry.th32ProcessID,
+                        entry.szExeFile,
+                        entry.th32ParentProcessID,
+                        L"",
+                        true
+                    };
+                    currentProcesses[entry.th32ProcessID] = info;
 
-    std::wcout << L"Process and its children finished successfully.\n";
+                    if (previousProcesses.find(entry.th32ProcessID) == previousProcesses.end() && 
+                        processTree.shouldTrack(entry.th32ProcessID, entry.th32ParentProcessID)) {
+                        
+                        processTree.addProcess(info);
+                        
+                        std::wcout << L"[+] New process: " << info.name
+                                  << L" (PID: " << info.pid
+                                  << L", Parent: " << processTree.getProcessName(info.parentPid)
+                                  << L" [" << info.parentPid << L"])";
+                        
+                        // Add indicator if this process is being watched for program exit
+                        if (processTree.isWatchedForExit(info.pid)) {
+                            std::wcout << L" [TRACKED]";
+                        }
+                        std::wcout << L"\n";
+                    }
+                } while (Process32NextW(hSnapshot, &entry));
+            }
+            CloseHandle(hSnapshot);
+        }
 
-    // Set the exit flag to stop the monitoring thread
-    exitFlag = true;
+        // Check for ended processes
+        for (const auto& prev : previousProcesses) {
+            if ((currentProcesses.find(prev.first) == currentProcesses.end() || !isProcessRunning(prev.first)) 
+                && processTree.isTracked(prev.first)) {
+                
+                const ProcessInfo& info = prev.second;
+                std::wcout << L"[-] Process ended: " << info.name 
+                          << L" (PID: " << info.pid << L")";
+                
+                if (processTree.isWatchedForExit(info.pid)) {
+                    std::wcout << L" [TRACKED]";
+                }
+                std::wcout << L"\n";
+            }
+        }
 
-    // Wait for the monitoring thread to finish
-    monitorThread.join();
+        previousProcesses = currentProcesses;
 
-    // Close handles
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+        if (!processTree.isRunning()) {
+            std::wcout << L"All tracked processes have ended. Exiting...\n";
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return 0;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     return 0;
 }
